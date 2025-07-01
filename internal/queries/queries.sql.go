@@ -494,6 +494,52 @@ func (q *Queries) GetForeignKeyConstraints(ctx context.Context) ([]GetForeignKey
 	return items, nil
 }
 
+const getFunctionTableDependencies = `-- name: GetFunctionTableDependencies :many
+SELECT DISTINCT
+    depends_on_c.relname::TEXT AS depends_on_table_name,
+    depends_on_ns.nspname::TEXT AS depends_on_table_schema_name
+FROM pg_catalog.pg_depend AS depend
+INNER JOIN pg_catalog.pg_class AS depends_on_c
+    ON depend.refobjid = depends_on_c.oid
+INNER JOIN pg_catalog.pg_namespace AS depends_on_ns
+    ON depends_on_c.relnamespace = depends_on_ns.oid
+WHERE
+    depend.classid = 'pg_proc'::REGCLASS
+    AND depend.objid = $1::OID
+    AND depend.refclassid = 'pg_class'::REGCLASS
+    AND depend.deptype = 'n'
+    AND depends_on_c.relkind = 'r' -- 'r' for table
+    AND depends_on_ns.nspname NOT IN ('pg_catalog', 'information_schema')
+`
+
+type GetFunctionTableDependenciesRow struct {
+	DependsOnTableName       string
+	DependsOnTableSchemaName string
+}
+
+func (q *Queries) GetFunctionTableDependencies(ctx context.Context, functionOid interface{}) ([]GetFunctionTableDependenciesRow, error) {
+	rows, err := q.db.QueryContext(ctx, getFunctionTableDependencies, functionOid)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var items []GetFunctionTableDependenciesRow
+	for rows.Next() {
+		var i GetFunctionTableDependenciesRow
+		if err := rows.Scan(&i.DependsOnTableName, &i.DependsOnTableSchemaName); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Close(); err != nil {
+		return nil, err
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
 const getIndexes = `-- name: GetIndexes :many
 SELECT
     c.oid,
