@@ -639,7 +639,7 @@ func (schemaSQLGenerator) Alter(diff schemaDiff) ([]Statement, error) {
 	}
 	partialGraph = concatPartialGraphs(partialGraph, sequenceOwnershipsPartialGraph)
 
-	functionGenerator := newFunctionSqlVertexGenerator(functionsInNewSchemaByName)
+	functionGenerator := newFunctionSqlVertexGenerator(functionsInNewSchemaByName, diff.tableDiffs.alters)
 	functionsPartialGraph, err := generatePartialGraph(functionGenerator, diff.functionDiffs)
 	if err != nil {
 		return nil, fmt.Errorf("resolving function diff: %w", err)
