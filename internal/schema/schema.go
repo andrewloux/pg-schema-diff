@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"regexp"
 	"sort"
+	"strings"
 
 	"github.com/mitchellh/hashstructure/v2"
 	"github.com/stripe/pg-schema-diff/internal/concurrent"
@@ -53,12 +54,14 @@ type Schema struct {
 	Extensions            []Extension
 	Enums                 []Enum
 	Tables                []Table
+	Views                 []View
 	Indexes               []Index
 	ForeignKeyConstraints []ForeignKeyConstraint
 	Sequences             []Sequence
 	Functions             []Function
 	Procedures            []Procedure
 	Triggers              []Trigger
+	EventTriggers         []EventTrigger
 }
 
 // Normalize normalizes the schema (alphabetically sorts tables and columns in tables).
@@ -74,6 +77,14 @@ func (s Schema) Normalize() Schema {
 	}
 	s.Tables = normTables
 
+	var normViews []View
+	for _, view := range sortSchemaObjectsByName(s.Views) {
+		view.DependsOnTables = sortSchemaObjectsByName(view.DependsOnTables)
+		view.DependsOnViews = sortSchemaObjectsByName(view.DependsOnViews)
+		normViews = append(normViews, view)
+	}
+	s.Views = normViews
+
 	s.Indexes = sortSchemaObjectsByName(s.Indexes)
 	s.ForeignKeyConstraints = sortSchemaObjectsByName(s.ForeignKeyConstraints)
 	s.Sequences = sortSchemaObjectsByName(s.Sequences)
@@ -87,6 +98,13 @@ func (s Schema) Normalize() Schema {
 
 	s.Procedures = sortSchemaObjectsByName(s.Procedures)
 	s.Triggers = sortSchemaObjectsByName(s.Triggers)
+	
+	var normEventTriggers []EventTrigger
+	for _, et := range sortSchemaObjectsByName(s.EventTriggers) {
+		et.Tags = sortByKey(et.Tags, func(s string) string { return s })
+		normEventTriggers = append(normEventTriggers, et)
+	}
+	s.EventTriggers = normEventTriggers
 
 	return s
 }
@@ -199,6 +217,16 @@ func (t Table) IsPartitioned() bool {
 // Instead, the fields should be stored under the same struct as a nilable pointer, and this function should be deleted.
 func (t Table) IsPartition() bool {
 	return t.ParentTable != nil
+}
+
+type View struct {
+	SchemaQualifiedName
+	// Definition is the SQL definition of the view (the SELECT statement)
+	Definition string
+	// DependsOnTables contains the tables this view depends on
+	DependsOnTables []SchemaQualifiedName
+	// DependsOnViews contains other views this view depends on
+	DependsOnViews []SchemaQualifiedName
 }
 
 type ColumnIdentityType string
@@ -438,6 +466,18 @@ func (t Trigger) GetName() string {
 	return t.OwningTable.GetFQEscapedName() + "-" + t.EscapedName
 }
 
+type EventTrigger struct {
+	Name       string
+	Event      string // e.g., "ddl_command_start", "ddl_command_end", "table_rewrite", "sql_drop"
+	Function   SchemaQualifiedName
+	Enabled    string // 'O' = enabled, 'D' = disabled, 'R' = replica only, 'A' = always
+	Tags       []string // e.g., ["CREATE TABLE", "ALTER TABLE"]
+}
+
+func (e EventTrigger) GetName() string {
+	return e.Name
+}
+
 type (
 	GetSchemaOpt func(*getSchemaOptions)
 )
@@ -602,6 +642,13 @@ func (s *schemaFetcher) getSchema(ctx context.Context) (Schema, error) {
 	if err != nil {
 		return Schema{}, fmt.Errorf("starting tables future: %w", err)
 	}
+	
+	viewsFuture, err := concurrent.SubmitFuture(ctx, goroutineRunner, func() ([]View, error) {
+		return s.fetchViews(ctx)
+	})
+	if err != nil {
+		return Schema{}, fmt.Errorf("starting views future: %w", err)
+	}
 
 	indexesFuture, err := concurrent.SubmitFuture(ctx, goroutineRunner, func() ([]Index, error) {
 		return s.fetchIndexes(ctx)
@@ -644,6 +691,13 @@ func (s *schemaFetcher) getSchema(ctx context.Context) (Schema, error) {
 	if err != nil {
 		return Schema{}, fmt.Errorf("starting triggers future: %w", err)
 	}
+	
+	eventTriggersFuture, err := concurrent.SubmitFuture(ctx, goroutineRunner, func() ([]EventTrigger, error) {
+		return s.fetchEventTriggers(ctx)
+	})
+	if err != nil {
+		return Schema{}, fmt.Errorf("starting event triggers future: %w", err)
+	}
 
 	schemas, err := namedSchemasFuture.Get(ctx)
 	if err != nil {
@@ -663,6 +717,11 @@ func (s *schemaFetcher) getSchema(ctx context.Context) (Schema, error) {
 	tables, err := tablesFuture.Get(ctx)
 	if err != nil {
 		return Schema{}, fmt.Errorf("getting tables: %w", err)
+	}
+	
+	views, err := viewsFuture.Get(ctx)
+	if err != nil {
+		return Schema{}, fmt.Errorf("getting views: %w", err)
 	}
 
 	indexes, err := indexesFuture.Get(ctx)
@@ -694,18 +753,25 @@ func (s *schemaFetcher) getSchema(ctx context.Context) (Schema, error) {
 	if err != nil {
 		return Schema{}, fmt.Errorf("getting triggers: %w", err)
 	}
+	
+	eventTriggers, err := eventTriggersFuture.Get(ctx)
+	if err != nil {
+		return Schema{}, fmt.Errorf("getting event triggers: %w", err)
+	}
 
 	return Schema{
 		NamedSchemas:          schemas,
 		Extensions:            extensions,
 		Enums:                 enums,
 		Tables:                tables,
+		Views:                 views,
 		Indexes:               indexes,
 		ForeignKeyConstraints: fkCons,
 		Sequences:             sequences,
 		Functions:             functions,
 		Procedures:            procedures,
 		Triggers:              triggers,
+		EventTriggers:         eventTriggers,
 	}, nil
 }
 
@@ -1132,8 +1198,68 @@ func (s *schemaFetcher) fetchSequences(ctx context.Context) ([]Sequence, error) 
 	return seqs, nil
 }
 
+func (s *schemaFetcher) fetchViews(ctx context.Context) ([]View, error) {
+	rawViews, err := s.q.GetViews(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("GetViews: %w", err)
+	}
+	
+	var views []View
+	for _, rawView := range rawViews {
+		// Get view dependencies
+		deps, err := s.q.GetViewDependencies(ctx, queries.GetViewDependenciesParams{
+			Relname: rawView.ViewName,
+			Nspname: rawView.ViewSchemaName,
+		})
+		if err != nil {
+			return nil, fmt.Errorf("GetViewDependencies(%s.%s): %w", rawView.ViewSchemaName, rawView.ViewName, err)
+		}
+		
+		var dependsOnTables []SchemaQualifiedName
+		var dependsOnViews []SchemaQualifiedName
+		
+		for _, dep := range deps {
+			kind, ok := dep.DependsOnKind.(string)
+			if !ok {
+				continue
+			}
+			if kind == "r" { // 'r' for relation (table)
+				dependsOnTables = append(dependsOnTables, SchemaQualifiedName{
+					SchemaName:  dep.DependsOnSchemaName,
+					EscapedName: EscapeIdentifier(dep.DependsOnName),
+				})
+			} else if kind == "v" { // 'v' for view
+				dependsOnViews = append(dependsOnViews, SchemaQualifiedName{
+					SchemaName:  dep.DependsOnSchemaName,
+					EscapedName: EscapeIdentifier(dep.DependsOnName),
+				})
+			}
+		}
+		
+		views = append(views, View{
+			SchemaQualifiedName: SchemaQualifiedName{
+				SchemaName:  rawView.ViewSchemaName,
+				EscapedName: EscapeIdentifier(rawView.ViewName),
+			},
+			Definition:       rawView.ViewDefinition,
+			DependsOnTables: dependsOnTables,
+			DependsOnViews:  dependsOnViews,
+		})
+	}
+	
+	views = filterSliceByName(
+		views,
+		func(view View) SchemaQualifiedName {
+			return view.SchemaQualifiedName
+		},
+		s.nameFilter,
+	)
+	
+	return views, nil
+}
+
 func (s *schemaFetcher) fetchFunctions(ctx context.Context) ([]Function, error) {
-	rawFunctions, err := s.q.GetProcs(ctx, 'f')
+	rawFunctions, err := s.q.GetProcs(ctx, "f")
 	if err != nil {
 		return nil, fmt.Errorf("GetProcs: %w", err)
 	}
@@ -1199,7 +1325,7 @@ func (s *schemaFetcher) fetchDependsOnFunctions(ctx context.Context, systemCatal
 }
 
 func (s *schemaFetcher) fetchProcedures(ctx context.Context) ([]Procedure, error) {
-	rawProcedures, err := s.q.GetProcs(ctx, 'p')
+	rawProcedures, err := s.q.GetProcs(ctx, "p")
 	if err != nil {
 		return nil, fmt.Errorf("GetProcs: %w", err)
 	}
@@ -1263,6 +1389,48 @@ func (s *schemaFetcher) fetchPolicies(ctx context.Context) ([]policyAndTable, er
 	)
 
 	return policies, nil
+}
+
+func (s *schemaFetcher) fetchEventTriggers(ctx context.Context) ([]EventTrigger, error) {
+	rawEventTriggers, err := s.q.GetEventTriggers(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("GetEventTriggers: %w", err)
+	}
+	
+	var eventTriggers []EventTrigger
+	for _, rawET := range rawEventTriggers {
+		// Parse function name to get schema and name
+		// Function name is in format "schema.function_name()" or just "function_name()"
+		funcParts := strings.Split(rawET.FunctionName, ".")
+		var funcSchema, funcName string
+		if len(funcParts) == 2 {
+			funcSchema = strings.Trim(funcParts[0], `"`)
+			funcName = strings.Trim(funcParts[1], `"`)
+		} else {
+			funcSchema = "public"
+			funcName = strings.Trim(funcParts[0], `"`)
+		}
+		// Remove parentheses if present
+		funcName = strings.TrimSuffix(funcName, "()")
+		
+		enabled, ok := rawET.Enabled.(string)
+		if !ok {
+			enabled = "O" // Default to enabled
+		}
+		
+		eventTriggers = append(eventTriggers, EventTrigger{
+			Name:  rawET.EventTriggerName,
+			Event: rawET.Event,
+			Function: SchemaQualifiedName{
+				SchemaName:  funcSchema,
+				EscapedName: EscapeIdentifier(funcName),
+			},
+			Enabled: enabled,
+			Tags:    rawET.Tags,
+		})
+	}
+	
+	return eventTriggers, nil
 }
 
 func (s *schemaFetcher) fetchTriggers(ctx context.Context) ([]Trigger, error) {

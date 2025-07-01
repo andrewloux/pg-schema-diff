@@ -323,6 +323,56 @@ WHERE
     AND trig.tgparentid = 0
     AND NOT trig.tgisinternal;
 
+-- name: GetViews :many
+SELECT
+    c.relname::TEXT AS view_name,
+    view_namespace.nspname::TEXT AS view_schema_name,
+    pg_catalog.pg_get_viewdef(c.oid, true) AS view_definition
+FROM pg_catalog.pg_class AS c
+INNER JOIN
+    pg_catalog.pg_namespace AS view_namespace
+    ON c.relnamespace = view_namespace.oid
+WHERE
+    view_namespace.nspname NOT IN ('pg_catalog', 'information_schema')
+    AND view_namespace.nspname !~ '^pg_toast'
+    AND view_namespace.nspname !~ '^pg_temp'
+    AND c.relkind = 'v'
+    -- Exclude views belonging to extensions
+    AND NOT EXISTS (
+        SELECT depend.objid
+        FROM pg_catalog.pg_depend AS depend
+        WHERE
+            depend.classid = 'pg_class'::REGCLASS
+            AND depend.objid = c.oid
+            AND depend.deptype = 'e'
+    );
+
+-- name: GetViewDependencies :many
+SELECT
+    depends_on_c.relname::TEXT AS depends_on_name,
+    depends_on_ns.nspname::TEXT AS depends_on_schema_name,
+    depends_on_c.relkind AS depends_on_kind
+FROM pg_catalog.pg_rewrite AS rw
+INNER JOIN pg_catalog.pg_depend AS depend
+    ON rw.oid = depend.objid
+INNER JOIN pg_catalog.pg_class AS depends_on_c
+    ON depend.refobjid = depends_on_c.oid
+INNER JOIN pg_catalog.pg_namespace AS depends_on_ns
+    ON depends_on_c.relnamespace = depends_on_ns.oid
+INNER JOIN pg_catalog.pg_class AS view_c
+    ON rw.ev_class = view_c.oid
+INNER JOIN pg_catalog.pg_namespace AS view_ns
+    ON view_c.relnamespace = view_ns.oid
+WHERE
+    view_c.relname = $1
+    AND view_ns.nspname = $2
+    AND rw.rulename = '_RETURN'
+    AND depend.classid = 'pg_rewrite'::REGCLASS
+    AND depend.refclassid = 'pg_class'::REGCLASS
+    AND depend.deptype = 'n'
+    AND depends_on_c.relkind IN ('r', 'v') -- 'r' for table, 'v' for view
+    AND depends_on_ns.nspname NOT IN ('pg_catalog', 'information_schema');
+
 -- name: GetSequences :many
 SELECT
     seq_c.relname::TEXT AS sequence_name,
@@ -471,3 +521,14 @@ WHERE
     table_namespace.nspname NOT IN ('pg_catalog', 'information_schema')
     AND table_namespace.nspname !~ '^pg_toast'
     AND table_namespace.nspname !~ '^pg_temp';
+
+-- name: GetEventTriggers :many
+SELECT
+    evtname AS event_trigger_name,
+    evtevent AS event,
+    evtowner::regrole::TEXT AS owner,
+    evtfoid::regproc::TEXT AS function_name,
+    evtenabled AS enabled,
+    COALESCE(evttags, '{}')::TEXT[] AS tags
+FROM pg_catalog.pg_event_trigger
+ORDER BY evtname;
