@@ -337,6 +337,18 @@ func buildSchemaDiff(old, new schema.Schema) (schemaDiff, bool, error) {
 		return schemaDiff{}, false, fmt.Errorf("diffing triggers: %w", err)
 	}
 
+	eventTriggerDiffs, err := diffLists(old.EventTriggers, new.EventTriggers, func(old, new schema.EventTrigger, _, _ int) (eventTriggerDiff, bool, error) {
+		return eventTriggerDiff{
+			oldAndNew[schema.EventTrigger]{
+				old: old,
+				new: new,
+			},
+		}, false, nil
+	})
+	if err != nil {
+		return schemaDiff{}, false, fmt.Errorf("diffing event triggers: %w", err)
+	}
+
 	return schemaDiff{
 		oldAndNew: oldAndNew[schema.Schema]{
 			old: old,
@@ -353,6 +365,7 @@ func buildSchemaDiff(old, new schema.Schema) (schemaDiff, bool, error) {
 		functionDiffs:             functionDiffs,
 		proceduresDiffs:           procedureDiffs,
 		triggerDiffs:              triggerDiffs,
+		eventTriggerDiffs:         eventTriggerDiffs,
 	}, false, nil
 }
 
@@ -648,6 +661,14 @@ func (schemaSQLGenerator) Alter(diff schemaDiff) ([]Statement, error) {
 		return nil, fmt.Errorf("resolving trigger diff: %w", err)
 	}
 	partialGraph = concatPartialGraphs(partialGraph, triggersPartialGraph)
+
+	eventTriggerGenerator := newEventTriggerSQLVertexGenerator(diff.old.EventTriggers, diff.new.EventTriggers)
+	eventTriggersPartialGraph, err := generatePartialGraph(legacyToNewSqlVertexGenerator[schema.EventTrigger, eventTriggerDiff](eventTriggerGenerator), diff.eventTriggerDiffs)
+	if err != nil {
+		return nil, fmt.Errorf("resolving event trigger diff: %w", err)
+	}
+	partialGraph = concatPartialGraphs(partialGraph, eventTriggersPartialGraph)
+
 	sqlGraph, err := graphFromPartials(partialGraph)
 	if err != nil {
 		return nil, fmt.Errorf("converting to graph: %w", err)
