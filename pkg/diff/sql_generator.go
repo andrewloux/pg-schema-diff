@@ -105,6 +105,10 @@ type (
 		checkConstraintDiff listDiff[schema.CheckConstraint, checkConstraintDiff]
 		policiesDiff        listDiff[schema.Policy, policyDiff]
 	}
+	
+	viewDiff struct {
+		oldAndNew[schema.View]
+	}
 
 	indexDiff struct {
 		oldAndNew[schema.Index]
@@ -129,6 +133,10 @@ type (
 	triggerDiff struct {
 		oldAndNew[schema.Trigger]
 	}
+	
+	eventTriggerDiff struct {
+		oldAndNew[schema.EventTrigger]
+	}
 )
 
 type schemaDiff struct {
@@ -137,12 +145,14 @@ type schemaDiff struct {
 	extensionDiffs            listDiff[schema.Extension, extensionDiff]
 	enumDiffs                 listDiff[schema.Enum, enumDiff]
 	tableDiffs                listDiff[schema.Table, tableDiff]
+	viewDiffs                 listDiff[schema.View, viewDiff]
 	indexDiffs                listDiff[schema.Index, indexDiff]
 	foreignKeyConstraintDiffs listDiff[schema.ForeignKeyConstraint, foreignKeyConstraintDiff]
 	sequenceDiffs             listDiff[schema.Sequence, sequenceDiff]
 	functionDiffs             listDiff[schema.Function, functionDiff]
 	proceduresDiffs           listDiff[schema.Procedure, procedureDiff]
 	triggerDiffs              listDiff[schema.Trigger, triggerDiff]
+	eventTriggerDiffs         listDiff[schema.EventTrigger, eventTriggerDiff]
 }
 
 func (sd schemaDiff) resolveToSQL() ([]Statement, error) {
@@ -229,6 +239,18 @@ func buildSchemaDiff(old, new schema.Schema) (schemaDiff, bool, error) {
 	tableDiffs, err := diffLists(old.Tables, new.Tables, buildTableDiff)
 	if err != nil {
 		return schemaDiff{}, false, fmt.Errorf("diffing tables: %w", err)
+	}
+	
+	viewDiffs, err := diffLists(old.Views, new.Views, func(old, new schema.View, _, _ int) (viewDiff, bool, error) {
+		return viewDiff{
+			oldAndNew[schema.View]{
+				old: old,
+				new: new,
+			},
+		}, false, nil
+	})
+	if err != nil {
+		return schemaDiff{}, false, fmt.Errorf("diffing views: %w", err)
 	}
 
 	newSchemaTablesByName := buildSchemaObjByNameMap(new.Tables)
@@ -324,6 +346,7 @@ func buildSchemaDiff(old, new schema.Schema) (schemaDiff, bool, error) {
 		extensionDiffs:            extensionDiffs,
 		enumDiffs:                 enumDiffs,
 		tableDiffs:                tableDiffs,
+		viewDiffs:                 viewDiffs,
 		indexDiffs:                indexesDiff,
 		foreignKeyConstraintDiffs: foreignKeyConstraintDiffs,
 		sequenceDiffs:             sequencesDiffs,
@@ -528,6 +551,17 @@ func (schemaSQLGenerator) Alter(diff schemaDiff) ([]Statement, error) {
 		return nil, fmt.Errorf("resolving table diff: %w", err)
 	}
 	partialGraph = concatPartialGraphs(partialGraph, tablePartialGraph)
+
+	// Add view handling
+	viewGenerator := legacyToNewSqlVertexGenerator[schema.View, viewDiff](&viewSQLVertexGenerator{
+		tablesInNewSchemaByName: tablesInNewSchemaByName,
+		viewsInNewSchemaByName: buildSchemaObjByNameMap(diff.new.Views),
+	})
+	viewsPartialGraph, err := generatePartialGraph(viewGenerator, diff.viewDiffs)
+	if err != nil {
+		return nil, fmt.Errorf("resolving view diff: %w", err)
+	}
+	partialGraph = concatPartialGraphs(partialGraph, viewsPartialGraph)
 
 	extensionStatements, err := diff.extensionDiffs.resolveToSQLGroupedByEffect(&extensionSQLGenerator{})
 	if err != nil {
