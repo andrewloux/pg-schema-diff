@@ -247,3 +247,14 @@ func (e *Engine) CreateDatabaseWithName(name string) (*DB, error) {
 		connOpts: e.GetPostgresDatabaseConnOpts().With(ConnectionOptionDatabase, name),
 	}, nil
 }
+
+func (e *Engine) CreateDatabaseWithSuperuser() (*DB, error) {
+	uuid, err := uuid.NewRandom()
+	if err != nil {
+		return nil, fmt.Errorf("generating uuid: %w", err)
+	}
+	testDBName := fmt.Sprintf("pgtestdb_%v", uuid.String())
+
+	// Create database using superuser connection
+	return e.CreateDatabaseWithName(testDBName)
+}
