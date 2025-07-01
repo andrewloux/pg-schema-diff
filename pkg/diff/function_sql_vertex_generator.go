@@ -11,15 +11,16 @@ type functionSQLVertexGenerator struct {
 	// functionsInNewSchemaByName is a map of function name to functions in the new schema.
 	// These functions are not necessarily new
 	functionsInNewSchemaByName map[string]schema.Function
-	// alteredTableDiffs contains information about tables that are being altered
-	// This is used to ensure functions are created after table alterations
-	alteredTableDiffs []tableDiff
+	
+	// Track table alterations happening in this migration so we can ensure
+	// functions run after columns they depend on are added
+	tableDiffs []tableDiff
 }
 
-func newFunctionSqlVertexGenerator(functionsInNewSchemaByName map[string]schema.Function, alteredTableDiffs []tableDiff) sqlVertexGenerator[schema.Function, functionDiff] {
+func newFunctionSqlVertexGenerator(functionsInNewSchemaByName map[string]schema.Function, tableDiffs []tableDiff) sqlVertexGenerator[schema.Function, functionDiff] {
 	return legacyToNewSqlVertexGenerator[schema.Function, functionDiff](&functionSQLVertexGenerator{
 		functionsInNewSchemaByName: functionsInNewSchemaByName,
-		alteredTableDiffs:          alteredTableDiffs,
+		tableDiffs: tableDiffs,
 	})
 }
 
@@ -91,15 +92,45 @@ func (f *functionSQLVertexGenerator) GetAddAlterDependencies(newFunction, oldFun
 		deps = append(deps, mustRun(f.GetSQLVertexId(newFunction, diffTypeAddAlter)).after(buildFunctionVertexId(depFunction, diffTypeAddAlter)))
 	}
 
-	// IMPORTANT: Functions may reference table columns that are being added in the same migration.
-	// We need to ensure that all table alterations (especially column additions) happen before
-	// function creation/updates. This is a conservative approach but ensures correctness.
-	for _, tableDiff := range f.alteredTableDiffs {
-		// Make this function depend on the table alteration being complete
-		tableName := tableDiff.new.GetFQEscapedName()
+	// A function depends on all tables it references
+	for _, depTable := range newFunction.DependsOnTables {
 		deps = append(deps, mustRun(f.GetSQLVertexId(newFunction, diffTypeAddAlter)).after(
-			buildSchemaObjVertexId("table", tableName, diffTypeAddAlter),
+			buildSchemaObjVertexId("table", depTable.GetFQEscapedName(), diffTypeAddAlter),
 		))
+	}
+
+	// Check if any columns this function references are being added in this migration
+	// If so, ensure the function is created after those table alterations
+	for _, colRef := range newFunction.ReferencedColumns {
+		for _, tableDiff := range f.tableDiffs {
+			// Check if this table is being altered and has new columns
+			if tableDiff.old.GetName() == colRef.TableName || tableDiff.new.GetName() == colRef.TableName {
+				// Check if the referenced column is new (not in old table)
+				isNewColumn := false
+				if !cmp.Equal(tableDiff.old, schema.Table{}) {
+					// Table exists, check if column is new
+					found := false
+					for _, oldCol := range tableDiff.old.Columns {
+						if oldCol.Name == colRef.ColumnName {
+							found = true
+							break
+						}
+					}
+					if !found {
+						// Column not in old table, so it's being added
+						isNewColumn = true
+					}
+				}
+				
+				if isNewColumn {
+					// Make function depend on this table's alteration
+					tableName := tableDiff.new.GetFQEscapedName()
+					deps = append(deps, mustRun(f.GetSQLVertexId(newFunction, diffTypeAddAlter)).after(
+						buildSchemaObjVertexId("table", tableName, diffTypeAddAlter),
+					))
+				}
+			}
+		}
 	}
 
 	if !cmp.Equal(oldFunction, schema.Function{}) {

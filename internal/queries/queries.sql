@@ -296,6 +296,23 @@ WHERE
     AND depend.objid = sqlc.arg(object_id)
     AND depend.deptype = 'n';
 
+-- name: GetFunctionTableDependencies :many
+SELECT DISTINCT
+    depends_on_c.relname::TEXT AS depends_on_table_name,
+    depends_on_ns.nspname::TEXT AS depends_on_table_schema_name
+FROM pg_catalog.pg_depend AS depend
+INNER JOIN pg_catalog.pg_class AS depends_on_c
+    ON depend.refobjid = depends_on_c.oid
+INNER JOIN pg_catalog.pg_namespace AS depends_on_ns
+    ON depends_on_c.relnamespace = depends_on_ns.oid
+WHERE
+    depend.classid = 'pg_proc'::REGCLASS
+    AND depend.objid = sqlc.arg(function_oid)::OID
+    AND depend.refclassid = 'pg_class'::REGCLASS
+    AND depend.deptype = 'n'
+    AND depends_on_c.relkind = 'r' -- 'r' for table
+    AND depends_on_ns.nspname NOT IN ('pg_catalog', 'information_schema');
+
 -- name: GetTriggers :many
 SELECT
     trig.tgname::TEXT AS trigger_name,

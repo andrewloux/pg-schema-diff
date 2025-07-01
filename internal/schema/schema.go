@@ -9,6 +9,7 @@ import (
 	"strings"
 
 	"github.com/mitchellh/hashstructure/v2"
+	pg_query "github.com/pganalyze/pg_query_go/v5"
 	"github.com/stripe/pg-schema-diff/internal/concurrent"
 	"github.com/stripe/pg-schema-diff/internal/queries"
 )
@@ -400,6 +401,17 @@ type Function struct {
 	// can track the dependencies of the function (or not)
 	Language           string
 	DependsOnFunctions []SchemaQualifiedName
+	// DependsOnTables contains the tables this function depends on
+	DependsOnTables []SchemaQualifiedName
+	// ReferencedColumns contains table.column pairs that this function references
+	// This is populated by parsing the function body for SQL functions
+	ReferencedColumns []TableColumnRef
+}
+
+// TableColumnRef represents a reference to a specific table column
+type TableColumnRef struct {
+	TableName  string
+	ColumnName string
 }
 
 type Procedure struct {
@@ -1299,12 +1311,34 @@ func (s *schemaFetcher) buildFunction(ctx context.Context, rawFunction queries.G
 		return Function{}, fmt.Errorf("fetchDependsOnFunctions(%s): %w", rawFunction.Oid, err)
 	}
 
-	return Function{
+	// Fetch table dependencies
+	tableDeps, err := s.q.GetFunctionTableDependencies(ctx, rawFunction.Oid)
+	if err != nil {
+		return Function{}, fmt.Errorf("GetFunctionTableDependencies(%s): %w", rawFunction.Oid, err)
+	}
+	
+	var dependsOnTables []SchemaQualifiedName
+	for _, dep := range tableDeps {
+		dependsOnTables = append(dependsOnTables, SchemaQualifiedName{
+			SchemaName:  dep.DependsOnTableSchemaName,
+			EscapedName: EscapeIdentifier(dep.DependsOnTableName),
+		})
+	}
+
+	fn := Function{
 		SchemaQualifiedName: buildProcName(rawFunction.FuncName, rawFunction.FuncIdentityArguments, rawFunction.FuncSchemaName),
 		FunctionDef:         rawFunction.FuncDef,
 		Language:            rawFunction.FuncLang,
 		DependsOnFunctions:  dependsOnFunctions,
-	}, nil
+		DependsOnTables:     dependsOnTables,
+	}
+
+	// For SQL functions, parse the body to extract column references
+	if rawFunction.FuncLang == "sql" {
+		fn.ReferencedColumns = extractColumnReferences(rawFunction.FuncDef)
+	}
+
+	return fn, nil
 }
 
 func (s *schemaFetcher) fetchDependsOnFunctions(ctx context.Context, systemCatalog string, oid any) ([]SchemaQualifiedName, error) {
@@ -1486,4 +1520,182 @@ func FQEscapedColumnName(table SchemaQualifiedName, columnName string) string {
 
 func EscapeIdentifier(name string) string {
 	return fmt.Sprintf("\"%s\"", name)
+}
+
+// extractColumnReferences parses a SQL function body and extracts table.column references
+func extractColumnReferences(functionDef string) []TableColumnRef {
+	var refs []TableColumnRef
+	seen := make(map[string]bool)
+	
+	// Extract the function body from the CREATE FUNCTION statement
+	// Look for content between AS $function$ ... $function$ or AS $$ ... $$
+	bodyRe := regexp.MustCompile(`(?is)AS\s+\$[^$]*\$(.*)\$[^$]*\$`)
+	matches := bodyRe.FindStringSubmatch(functionDef)
+	if len(matches) < 2 {
+		return refs
+	}
+	
+	body := strings.TrimSpace(matches[1])
+	
+	// Parse the function body using pg_query
+	result, err := pg_query.Parse(body)
+	if err != nil {
+		// If parsing fails, fall back to regex-based approach
+		return extractColumnReferencesRegex(body)
+	}
+	
+	// Walk through the parse tree to find column references
+	for _, stmt := range result.Stmts {
+		extractRefsFromNode(stmt.Stmt, &refs, &seen)
+	}
+	
+	return refs
+}
+
+// extractRefsFromNode recursively walks the parse tree to find column references
+func extractRefsFromNode(node *pg_query.Node, refs *[]TableColumnRef, seen *map[string]bool) {
+	if node == nil {
+		return
+	}
+	
+	// First, check all possible node types that might contain other nodes
+	// This ensures we don't miss any nested structures
+	
+	// Handle ColumnRef nodes - these represent column references
+	if colRef := node.GetColumnRef(); colRef != nil {
+		var tableName, columnName string
+		
+		// ColumnRef fields is a list that can be:
+		// - [column] for unqualified column reference
+		// - [table, column] for qualified reference
+		// - [schema, table, column] for fully qualified reference
+		if len(colRef.Fields) >= 2 {
+			// Qualified reference: table.column
+			if tableNode := colRef.Fields[0].GetString_(); tableNode != nil {
+				tableName = tableNode.Sval
+			}
+			if colNode := colRef.Fields[1].GetString_(); colNode != nil {
+				columnName = colNode.Sval
+			}
+			
+			if tableName != "" && columnName != "" {
+				key := tableName + "." + columnName
+				if !(*seen)[key] {
+					(*seen)[key] = true
+					*refs = append(*refs, TableColumnRef{
+						TableName:  tableName,
+						ColumnName: columnName,
+					})
+				}
+			}
+		}
+		return // ColumnRef is a leaf node
+	}
+	
+	// Handle SelectStmt
+	if selectStmt := node.GetSelectStmt(); selectStmt != nil {
+		// Process target list
+		for _, target := range selectStmt.TargetList {
+			extractRefsFromNode(target, refs, seen)
+		}
+		
+		// Process FROM clause
+		for _, from := range selectStmt.FromClause {
+			extractRefsFromNode(from, refs, seen)
+		}
+		
+		// Process WHERE clause
+		if selectStmt.WhereClause != nil {
+			extractRefsFromNode(selectStmt.WhereClause, refs, seen)
+		}
+	}
+	
+	// Handle ResTarget (result target in SELECT list)
+	if resTarget := node.GetResTarget(); resTarget != nil {
+		if resTarget.Val != nil {
+			extractRefsFromNode(resTarget.Val, refs, seen)
+		}
+	}
+	
+	// Handle A_Expr (expressions)
+	if aExpr := node.GetAExpr(); aExpr != nil {
+		if aExpr.Lexpr != nil {
+			extractRefsFromNode(aExpr.Lexpr, refs, seen)
+		}
+		if aExpr.Rexpr != nil {
+			extractRefsFromNode(aExpr.Rexpr, refs, seen)
+		}
+	}
+	
+	// Handle FuncCall (function calls)
+	if funcCall := node.GetFuncCall(); funcCall != nil {
+		for _, arg := range funcCall.Args {
+			extractRefsFromNode(arg, refs, seen)
+		}
+	}
+	
+	// Handle CoalesceExpr
+	if coalesceExpr := node.GetCoalesceExpr(); coalesceExpr != nil {
+		for _, arg := range coalesceExpr.Args {
+			extractRefsFromNode(arg, refs, seen)
+		}
+	}
+	
+	// Handle List nodes (generic lists)
+	if list := node.GetList(); list != nil {
+		for _, item := range list.Items {
+			extractRefsFromNode(item, refs, seen)
+		}
+	}
+	
+	// Handle RangeVar (table references in FROM clause)
+	if rangeVar := node.GetRangeVar(); rangeVar != nil {
+		// Track the table name for context
+		// Note: We'd need more sophisticated tracking to handle aliases
+	}
+	
+	// Handle JoinExpr
+	if joinExpr := node.GetJoinExpr(); joinExpr != nil {
+		if joinExpr.Larg != nil {
+			extractRefsFromNode(joinExpr.Larg, refs, seen)
+		}
+		if joinExpr.Rarg != nil {
+			extractRefsFromNode(joinExpr.Rarg, refs, seen)
+		}
+		if joinExpr.Quals != nil {
+			extractRefsFromNode(joinExpr.Quals, refs, seen)
+		}
+	}
+}
+
+// extractColumnReferencesRegex is a fallback using regex when parsing fails
+func extractColumnReferencesRegex(body string) []TableColumnRef {
+	var refs []TableColumnRef
+	seen := make(map[string]bool)
+	
+	// Pattern to match table.column references
+	columnRefRe := regexp.MustCompile(`\b(\w+)\.(\w+)\b`)
+	
+	for _, match := range columnRefRe.FindAllStringSubmatch(body, -1) {
+		if len(match) >= 3 {
+			tableName := match[1]
+			columnName := match[2]
+			
+			// Skip some common false positives
+			if tableName == "pg_catalog" || tableName == "information_schema" {
+				continue
+			}
+			
+			key := tableName + "." + columnName
+			if !seen[key] {
+				seen[key] = true
+				refs = append(refs, TableColumnRef{
+					TableName:  tableName,
+					ColumnName: columnName,
+				})
+			}
+		}
+	}
+	
+	return refs
 }
