@@ -1,12 +1,11 @@
 package schema
 
 import (
-	"fmt"
 	"testing"
 )
 
-// TestPlutoMigrationPatterns tests patterns found in actual Pluto migrations
-func TestPlutoMigrationPatterns(t *testing.T) {
+// TestDatabaseMigrationPatterns tests patterns found in typical database migrations
+func TestDatabaseMigrationPatterns(t *testing.T) {
 	tests := []struct {
 		name        string
 		functionDef string
@@ -14,22 +13,22 @@ func TestPlutoMigrationPatterns(t *testing.T) {
 		description string
 	}{
 		{
-			name: "treasury double-entry function",
-			functionDef: `CREATE OR REPLACE FUNCTION treasury.validate_journal_entry()
+			name: "accounting validation function",
+			functionDef: `CREATE OR REPLACE FUNCTION accounting.validate_transaction()
 RETURNS trigger
 LANGUAGE plpgsql
 AS $function$
 BEGIN
-    -- Validate that debits equal credits
-    IF (SELECT SUM(CASE WHEN entry_type = 'debit' THEN amount ELSE -amount END) 
-        FROM treasury.journal_entries 
-        WHERE transaction_id = NEW.transaction_id) != 0 THEN
-        RAISE EXCEPTION 'Journal entry must balance: debits must equal credits';
+    -- Validate that amounts balance
+    IF (SELECT SUM(CASE WHEN transaction_type = 'debit' THEN amount ELSE -amount END) 
+        FROM accounting.transactions 
+        WHERE batch_id = NEW.batch_id) != 0 THEN
+        RAISE EXCEPTION 'Transaction must balance: debits must equal credits';
     END IF;
     
     -- Validate account exists and is active
     IF NOT EXISTS (
-        SELECT 1 FROM treasury.accounts 
+        SELECT 1 FROM accounting.accounts 
         WHERE id = NEW.account_id 
         AND is_active = true
     ) THEN
@@ -40,36 +39,36 @@ BEGIN
 END;
 $function$`,
 			wantRefs: []TableColumnRef{
-				{TableName: "treasury", ColumnName: "journal_entries"},
-				{TableName: "treasury", ColumnName: "accounts"},
+				{TableName: "accounting", ColumnName: "transactions"},
+				{TableName: "accounting", ColumnName: "accounts"},
 			},
 			description: "Complex PL/pgSQL function with schema-qualified tables",
 		},
 		{
 			name: "computed field with row parameter",
-			functionDef: `CREATE OR REPLACE FUNCTION public.get_user_full_name(user_row users)
+			functionDef: `CREATE OR REPLACE FUNCTION public.get_person_display_name(person_row persons)
 RETURNS text
 LANGUAGE sql
 STABLE
 AS $function$
-    SELECT COALESCE(user_row.first_name || ' ' || user_row.last_name, user_row.email)
+    SELECT COALESCE(person_row.first_name || ' ' || person_row.last_name, person_row.email)
 $function$`,
 			wantRefs: []TableColumnRef{
-				{TableName: "user_row", ColumnName: "first_name"},
-				{TableName: "user_row", ColumnName: "last_name"},
-				{TableName: "user_row", ColumnName: "email"},
+				{TableName: "person_row", ColumnName: "first_name"},
+				{TableName: "person_row", ColumnName: "last_name"},
+				{TableName: "person_row", ColumnName: "email"},
 			},
-			description: "Hasura computed field pattern",
+			description: "Computed field pattern",
 		},
 		{
-			name: "workflow state transition function",
-			functionDef: `CREATE OR REPLACE FUNCTION workflows.transition_state(
-    p_workflow_id uuid,
+			name: "state machine transition function",
+			functionDef: `CREATE OR REPLACE FUNCTION process.transition_state(
+    p_process_id uuid,
     p_from_state text,
     p_to_state text,
     p_user_id uuid
 )
-RETURNS SETOF workflows.workflow_states
+RETURNS SETOF process.process_states
 LANGUAGE plpgsql
 AS $function$
 DECLARE
@@ -77,8 +76,8 @@ DECLARE
 BEGIN
     -- Get current state with lock
     SELECT state INTO v_current_state
-    FROM workflows.workflow_states
-    WHERE workflow_id = p_workflow_id
+    FROM process.process_states
+    WHERE process_id = p_process_id
     FOR UPDATE;
     
     -- Validate transition
@@ -88,33 +87,33 @@ BEGIN
     
     -- Check transition rules
     IF NOT EXISTS (
-        SELECT 1 FROM workflows.transition_rules
+        SELECT 1 FROM process.transition_rules
         WHERE from_state = p_from_state
         AND to_state = p_to_state
-        AND workflow_type = (
-            SELECT workflow_type 
-            FROM workflows.workflows 
-            WHERE id = p_workflow_id
+        AND process_type = (
+            SELECT process_type 
+            FROM process.processes 
+            WHERE id = p_process_id
         )
     ) THEN
         RAISE EXCEPTION 'Transition not allowed';
     END IF;
     
     -- Update state
-    UPDATE workflows.workflow_states
+    UPDATE process.process_states
     SET state = p_to_state,
         updated_by = p_user_id,
         updated_at = CURRENT_TIMESTAMP
-    WHERE workflow_id = p_workflow_id
+    WHERE process_id = p_process_id
     RETURNING *;
 END;
 $function$`,
 			wantRefs: []TableColumnRef{
-				{TableName: "workflows", ColumnName: "workflow_states"},
-				{TableName: "workflows", ColumnName: "transition_rules"},
-				{TableName: "workflows", ColumnName: "workflows"},
+				{TableName: "process", ColumnName: "process_states"},
+				{TableName: "process", ColumnName: "transition_rules"},
+				{TableName: "process", ColumnName: "processes"},
 			},
-			description: "Complex workflow function with multiple CTEs and subqueries",
+			description: "Complex state machine function with multiple CTEs and subqueries",
 		},
 		{
 			name: "audit trigger function",
@@ -170,9 +169,9 @@ LANGUAGE plpgsql
 AS $function$
 BEGIN
     -- Refresh in dependency order
-    REFRESH MATERIALIZED VIEW CONCURRENTLY public.user_stats;
-    REFRESH MATERIALIZED VIEW CONCURRENTLY public.organization_metrics;
-    REFRESH MATERIALIZED VIEW CONCURRENTLY public.card_usage_summary;
+    REFRESH MATERIALIZED VIEW CONCURRENTLY public.user_statistics;
+    REFRESH MATERIALIZED VIEW CONCURRENTLY public.department_analytics;
+    REFRESH MATERIALIZED VIEW CONCURRENTLY public.product_metrics;
     
     -- Update refresh timestamp
     UPDATE public.system_metadata 
@@ -182,9 +181,9 @@ BEGIN
 END;
 $function$`,
 			wantRefs: []TableColumnRef{
-				{TableName: "public", ColumnName: "user_stats"},
-				{TableName: "public", ColumnName: "organization_metrics"},
-				{TableName: "public", ColumnName: "card_usage_summary"},
+				{TableName: "public", ColumnName: "user_statistics"},
+				{TableName: "public", ColumnName: "department_analytics"},
+				{TableName: "public", ColumnName: "product_metrics"},
 				{TableName: "public", ColumnName: "system_metadata"},
 			},
 			description: "Function refreshing materialized views",
@@ -223,7 +222,7 @@ func TestEdgeCases(t *testing.T) {
 			name: "function with dollar quoted string containing SQL",
 			sql: `CREATE FUNCTION test() RETURNS text AS $$
 				DECLARE
-					query text := 'SELECT * FROM users WHERE active = true';
+					query text := 'SELECT * FROM employees WHERE active = true';
 				BEGIN
 					RETURN query;
 				END;
@@ -234,7 +233,7 @@ func TestEdgeCases(t *testing.T) {
 			name: "function with nested dollar quotes",
 			sql: `CREATE FUNCTION test() RETURNS text AS $outer$
 				BEGIN
-					RETURN $inner$SELECT * FROM users$inner$;
+					RETURN $inner$SELECT * FROM products$inner$;
 				END;
 			$outer$ LANGUAGE plpgsql;`,
 			shouldParse: true,
@@ -243,7 +242,7 @@ func TestEdgeCases(t *testing.T) {
 			name: "DO block (anonymous function)",
 			sql: `DO $$
 				BEGIN
-					UPDATE users SET migrated = true WHERE created_at < '2023-01-01';
+					UPDATE customers SET migrated = true WHERE created_at < '2023-01-01';
 				END;
 			$$;`,
 			shouldParse: true,
@@ -264,45 +263,6 @@ func TestEdgeCases(t *testing.T) {
 			// Try to extract references - mainly testing that we don't panic
 			refs := extractColumnReferencesRegex(tc.sql)
 			t.Logf("Found %d references in edge case", len(refs))
-		})
-	}
-}
-
-// TestDependencyTracking tests that our dependency tracking works correctly
-func TestDependencyTracking(t *testing.T) {
-	// This would test the actual dependency resolution in pg-schema-diff
-	// For now, we just document what should be tested
-	
-	scenarios := []struct {
-		name        string
-		description string
-	}{
-		{
-			name:        "function_after_column_add",
-			description: "Function using new column should come after ALTER TABLE ADD COLUMN",
-		},
-		{
-			name:        "view_after_table_create",
-			description: "View should be created after all referenced tables",
-		},
-		{
-			name:        "trigger_after_function",
-			description: "Trigger should be created after its trigger function",
-		},
-		{
-			name:        "computed_field_after_table",
-			description: "Hasura computed field functions should come after table creation",
-		},
-		{
-			name:        "materialized_view_dependencies",
-			description: "Materialized views should respect dependency order",
-		},
-	}
-	
-	for _, s := range scenarios {
-		t.Run(s.name, func(t *testing.T) {
-			t.Logf("Scenario: %s", s.description)
-			// These would be integration tests requiring actual database operations
 		})
 	}
 }

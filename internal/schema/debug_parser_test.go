@@ -10,14 +10,14 @@ import (
 )
 
 func TestDebugParser(t *testing.T) {
-	functionDef := `CREATE OR REPLACE FUNCTION get_full_name(user_id integer)
+	functionDef := `CREATE OR REPLACE FUNCTION get_employee_info(emp_id integer)
 RETURNS text
 LANGUAGE sql
 STABLE
 AS $function$
-    SELECT COALESCE(users.first_name || ' ' || users.last_name, users.email)
-    FROM users
-    WHERE users.id = user_id;
+    SELECT COALESCE(employees.first_name || ' ' || employees.last_name, employees.email)
+    FROM employees
+    WHERE employees.id = emp_id;
 $function$`
 
 	// Extract the function body
