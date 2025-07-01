@@ -43,4 +43,35 @@ $function$`
 	}
 	
 	t.Logf("Parse tree:\n%s", string(jsonBytes))
+	
+	// Verify the parse tree contains expected elements
+	if len(result.Stmts) != 1 {
+		t.Errorf("Expected 1 statement, got %d", len(result.Stmts))
+	}
+	
+	// Test that extractColumnReferences works on this function
+	refs := extractColumnReferences(functionDef)
+	t.Logf("Found %d column references", len(refs))
+	
+	// We should find references to employees table columns
+	expectedColumns := map[string]bool{
+		"first_name": false,
+		"last_name":  false,
+		"email":      false,
+		"id":         false,
+	}
+	
+	for _, ref := range refs {
+		if ref.TableName == "employees" {
+			if _, ok := expectedColumns[ref.ColumnName]; ok {
+				expectedColumns[ref.ColumnName] = true
+			}
+		}
+	}
+	
+	for col, found := range expectedColumns {
+		if !found {
+			t.Errorf("Expected to find reference to employees.%s", col)
+		}
+	}
 }

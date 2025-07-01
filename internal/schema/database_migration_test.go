@@ -202,10 +202,27 @@ $function$`,
 				t.Logf("  %s.%s", ref.TableName, ref.ColumnName)
 			}
 			
-			// For now, just ensure we don't crash on complex functions
-			// Full validation would require more sophisticated checks
+			// Check if we found any references when we expected them
 			if len(refs) == 0 && len(tt.wantRefs) > 0 {
 				t.Errorf("Expected to find references but found none")
+			}
+			
+			// Verify we found the expected table references (not exact column matches)
+			expectedTables := make(map[string]bool)
+			for _, want := range tt.wantRefs {
+				expectedTables[want.TableName] = true
+			}
+			
+			foundTables := make(map[string]bool)
+			for _, ref := range refs {
+				foundTables[ref.TableName] = true
+			}
+			
+			// Check that we found references to all expected tables
+			for table := range expectedTables {
+				if !foundTables[table] {
+					t.Errorf("Expected to find references to table %q but didn't", table)
+				}
 			}
 		})
 	}
@@ -260,9 +277,30 @@ func TestEdgeCases(t *testing.T) {
 
 	for _, tc := range edgeCases {
 		t.Run(tc.name, func(t *testing.T) {
-			// Try to extract references - mainly testing that we don't panic
-			refs := extractColumnReferencesRegex(tc.sql)
-			t.Logf("Found %d references in edge case", len(refs))
+			// Test with pg_query parser
+			refs := extractColumnReferences(tc.sql)
+			t.Logf("Parser found %d references", len(refs))
+			
+			// Test with regex fallback
+			regexRefs := extractColumnReferencesRegex(tc.sql)
+			t.Logf("Regex found %d references", len(regexRefs))
+			
+			// Verify specific expected references for some cases
+			switch tc.name {
+			case "function with dollar quoted string containing SQL":
+				// Should not parse the SQL inside the string literal
+				for _, ref := range refs {
+					if ref.TableName == "employees" {
+						t.Errorf("Parser incorrectly extracted table reference from string literal")
+					}
+				}
+			case "DO block (anonymous function)":
+				// DO blocks are anonymous and our parser doesn't extract references from them
+				// This is expected behavior - we focus on named functions
+				if len(refs) > 0 {
+					t.Logf("Note: Parser extracted %d references from DO block (this is fine)", len(refs))
+				}
+			}
 		})
 	}
 }
